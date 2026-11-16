@@ -1,0 +1,37 @@
+name: Sync Sudan Gold Prices
+
+on:
+  schedule:
+    # 10:00 AM, 2:00 PM, 6:00 PM Sudan Time (Africa/Khartoum, UTC+2)
+    - cron: "0 8,12,16 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync-gold:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Fetch XAU/USD, compute Sudan gold prices, save & broadcast
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          DEFAULT_PARALLEL_USD_SDG: ${{ vars.DEFAULT_PARALLEL_USD_SDG || '2700' }}
+          DEFAULT_OFFICIAL_USD_SDG: ${{ vars.DEFAULT_OFFICIAL_USD_SDG || '2020' }}
+          DEFAULT_CRAFTSMANSHIP_SDG: ${{ vars.DEFAULT_CRAFTSMANSHIP_SDG || '15000' }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://sudan-gold-exchange.vercel.app' }}
+        run: python scripts/gold_sync.py
