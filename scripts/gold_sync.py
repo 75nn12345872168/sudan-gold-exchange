@@ -129,8 +129,8 @@ def fetch_latest_rates_and_previous(
     service_key: str,
 ) -> tuple[float, float, float, float | None]:
     """Read latest USD/SDG rates, craftsmanship, and previous karat_24_sdg from Supabase."""
-    default_parallel = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "2700"))
-    default_official = float(os.getenv("DEFAULT_OFFICIAL_USD_SDG", "2020"))
+    default_parallel = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "12000"))
+    default_official = float(os.getenv("DEFAULT_OFFICIAL_USD_SDG", "9000"))
     default_craft = float(os.getenv("DEFAULT_CRAFTSMANSHIP_SDG", "15000"))
 
     headers = _supabase_headers(service_key)
@@ -140,6 +140,7 @@ def fetch_latest_rates_and_previous(
     official_usd_sdg = default_official
     craftsmanship_sdg = default_craft
     prev_karat_24: float | None = None
+    has_fx_rate = False
 
     try:
         fx_resp = requests.get(
@@ -158,6 +159,7 @@ def fetch_latest_rates_and_previous(
                 None,
             )
             if valid_fx:
+                has_fx_rate = True
                 parallel_usd_sdg = float(valid_fx["parallel_usd_sdg"])
                 official_usd_sdg = float(valid_fx.get("official_usd_sdg") or default_official)
                 craftsmanship_sdg = float(valid_fx.get("craftsmanship_sdg") or default_craft)
@@ -180,19 +182,19 @@ def fetch_latest_rates_and_previous(
                     for r in rows
                     if MIN_VALID_SDG <= float(r.get("parallel_usd_sdg") or 0) <= MAX_VALID_SDG
                 ),
-                rows[0],
+                None,
             )
-            prev_karat_24 = float(valid_gold["karat_24_sdg"])
-            if (
-                parallel_usd_sdg == default_parallel
-                and valid_gold.get("parallel_usd_sdg")
-                and MIN_VALID_SDG <= float(valid_gold["parallel_usd_sdg"]) <= MAX_VALID_SDG
-            ):
-                parallel_usd_sdg = float(valid_gold["parallel_usd_sdg"])
-            if official_usd_sdg == default_official and valid_gold.get("official_usd_sdg"):
-                official_usd_sdg = float(valid_gold["official_usd_sdg"])
-            if craftsmanship_sdg == default_craft and valid_gold.get("craftsmanship_sdg") is not None:
-                craftsmanship_sdg = float(valid_gold["craftsmanship_sdg"])
+            if valid_gold:
+                prev_karat_24 = float(valid_gold["karat_24_sdg"])
+                if not has_fx_rate and valid_gold.get("parallel_usd_sdg"):
+                    parallel_usd_sdg = float(valid_gold["parallel_usd_sdg"])
+                if not has_fx_rate and valid_gold.get("official_usd_sdg"):
+                    official_usd_sdg = float(valid_gold["official_usd_sdg"])
+                if (
+                    not has_fx_rate
+                    and valid_gold.get("craftsmanship_sdg") is not None
+                ):
+                    craftsmanship_sdg = float(valid_gold["craftsmanship_sdg"])
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] Could not read previous gold_prices: {exc}")
 
@@ -399,8 +401,8 @@ def main() -> int:
             supabase_url, service_key
         )
     else:
-        db_parallel_usd = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "2700"))
-        official_usd = float(os.getenv("DEFAULT_OFFICIAL_USD_SDG", "2020"))
+        db_parallel_usd = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "12000"))
+        official_usd = float(os.getenv("DEFAULT_OFFICIAL_USD_SDG", "9000"))
         craft_sdg = float(os.getenv("DEFAULT_CRAFTSMANSHIP_SDG", "15000"))
         prev_k24 = None
         print("[warn] Supabase env missing; using default FX rates.")

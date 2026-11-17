@@ -9,9 +9,9 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS public.exchange_rates (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  parallel_usd_sdg NUMERIC(12, 2) NOT NULL,
-  official_usd_sdg NUMERIC(12, 2) NOT NULL,
-  craftsmanship_sdg NUMERIC(12, 2) NOT NULL DEFAULT 15000,
+  parallel_usd_sdg NUMERIC(18, 2) NOT NULL,
+  official_usd_sdg NUMERIC(18, 2) NOT NULL,
+  craftsmanship_sdg NUMERIC(18, 2) NOT NULL DEFAULT 15000,
   source TEXT NOT NULL DEFAULT 'field_admin',
   notes TEXT
 );
@@ -23,16 +23,16 @@ CREATE INDEX IF NOT EXISTS idx_exchange_rates_recorded_at
 CREATE TABLE IF NOT EXISTS public.gold_prices (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  ounce_usd NUMERIC(12, 2) NOT NULL,
-  parallel_usd_sdg NUMERIC(12, 2) NOT NULL,
-  official_usd_sdg NUMERIC(12, 2) NOT NULL,
-  karat_24_sdg NUMERIC(14, 2) NOT NULL,
-  karat_22_sdg NUMERIC(14, 2) NOT NULL,
-  karat_21_sdg NUMERIC(14, 2) NOT NULL,
-  karat_18_sdg NUMERIC(14, 2) NOT NULL,
-  gold_pound_sdg NUMERIC(14, 2) NOT NULL,
-  craftsmanship_sdg NUMERIC(12, 2) NOT NULL DEFAULT 15000,
-  change_pct NUMERIC(6, 2) NOT NULL DEFAULT 0,
+  ounce_usd NUMERIC(18, 2) NOT NULL,
+  parallel_usd_sdg NUMERIC(18, 2) NOT NULL,
+  official_usd_sdg NUMERIC(18, 2) NOT NULL,
+  karat_24_sdg NUMERIC(18, 2) NOT NULL,
+  karat_22_sdg NUMERIC(18, 2) NOT NULL,
+  karat_21_sdg NUMERIC(18, 2) NOT NULL,
+  karat_18_sdg NUMERIC(18, 2) NOT NULL,
+  gold_pound_sdg NUMERIC(18, 2) NOT NULL,
+  craftsmanship_sdg NUMERIC(18, 2) NOT NULL DEFAULT 15000,
+  change_pct NUMERIC(18, 2) NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'auto_sync',
   notes TEXT
 );
@@ -89,8 +89,8 @@ INSERT INTO public.exchange_rates (
 )
 SELECT
   NOW(),
-  2700.00,
-  2020.00,
+  12000.00,
+  9000.00,
   15000.00,
   'initial_seed',
   'سعر الصرف والمصنعية الافتتاحي عند تأسيس المنصة'
@@ -98,20 +98,20 @@ WHERE NOT EXISTS (SELECT 1 FROM public.exchange_rates);
 
 WITH seed_days AS (
   SELECT * FROM (VALUES
-    (13, 3782.40, 2650.00, 1995.00, 0.00),
-    (12, 3791.10, 2655.00, 1995.00, 0.42),
-    (11, 3785.50, 2660.00, 2000.00, 0.04),
-    (10, 3802.20, 2665.00, 2000.00, 0.63),
-    (9,  3810.00, 2670.00, 2005.00, 0.39),
-    (8,  3806.40, 2675.00, 2005.00, 0.09),
-    (7,  3818.80, 2680.00, 2010.00, 0.51),
-    (6,  3826.50, 2680.00, 2010.00, 0.20),
-    (5,  3822.10, 2685.00, 2010.00, 0.07),
-    (4,  3834.00, 2690.00, 2015.00, 0.50),
-    (3,  3842.60, 2690.00, 2015.00, 0.22),
-    (2,  3849.30, 2695.00, 2020.00, 0.36),
-    (1,  3855.90, 2700.00, 2020.00, 0.36),
-    (0,  3861.17, 2700.00, 2020.00, 0.14)
+    (13, 3782.40, 11400.00, 8600.00, 0.00),
+    (12, 3791.10, 11450.00, 8650.00, 0.67),
+    (11, 3785.50, 11500.00, 8700.00, 0.29),
+    (10, 3802.20, 11550.00, 8700.00, 0.88),
+    (9,  3810.00, 11600.00, 8750.00, 0.64),
+    (8,  3806.40, 11650.00, 8750.00, 0.34),
+    (7,  3818.80, 11700.00, 8800.00, 0.76),
+    (6,  3826.50, 11750.00, 8800.00, 0.63),
+    (5,  3822.10, 11800.00, 8850.00, 0.31),
+    (4,  3834.00, 11850.00, 8900.00, 0.74),
+    (3,  3842.60, 11900.00, 8900.00, 0.65),
+    (2,  3849.30, 11950.00, 8950.00, 0.60),
+    (1,  3855.90, 12000.00, 9000.00, 0.59),
+    (0,  3861.17, 12000.00, 9000.00, 0.14)
   ) AS t(days_ago, ounce_usd, parallel_usd_sdg, official_usd_sdg, change_pct)
 ),
 computed AS (

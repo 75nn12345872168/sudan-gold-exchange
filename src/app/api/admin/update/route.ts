@@ -50,15 +50,21 @@ export async function POST(request: NextRequest) {
 
     const supabase = createAdminSupabaseClient();
 
-    // Fetch latest karat_24_sdg for accurate change_pct calculation
+    // Fetch latest valid karat_24_sdg (skipping corrupted < 500 SDG rows) for accurate change_pct
     const { data: prevRows } = await supabase
       .from("gold_prices")
-      .select("karat_24_sdg")
+      .select("karat_24_sdg, parallel_usd_sdg")
       .order("recorded_at", { ascending: false })
-      .limit(1);
+      .limit(10);
 
-    const previousKarat24 =
-      prevRows && prevRows.length > 0 ? Number(prevRows[0].karat_24_sdg) : null;
+    const validPrevRow = prevRows?.find((row) => {
+      const rate = Number(row.parallel_usd_sdg);
+      return Number.isFinite(rate) && rate >= 500 && rate <= 50000;
+    });
+
+    const previousKarat24 = validPrevRow
+      ? Number(validPrevRow.karat_24_sdg)
+      : null;
 
     const computed = calculateKaratsFromUsdSdg(ounceUsd, parallelUsdSdg);
     const changePct = calculateChangePct(computed.karat_24_sdg, previousKarat24);

@@ -32,8 +32,8 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           USD_SOURCE_URL: ${{ vars.USD_SOURCE_URL || secrets.USD_SOURCE_URL || '' }}
           USD_MAX_DEVIATION_PCT: ${{ vars.USD_MAX_DEVIATION_PCT || '0.25' }}
-          DEFAULT_PARALLEL_USD_SDG: ${{ vars.DEFAULT_PARALLEL_USD_SDG || '2700' }}
-          DEFAULT_OFFICIAL_USD_SDG: ${{ vars.DEFAULT_OFFICIAL_USD_SDG || '2020' }}
+          DEFAULT_PARALLEL_USD_SDG: ${{ vars.DEFAULT_PARALLEL_USD_SDG || '12000' }}
+          DEFAULT_OFFICIAL_USD_SDG: ${{ vars.DEFAULT_OFFICIAL_USD_SDG || '9000' }}
           DEFAULT_CRAFTSMANSHIP_SDG: ${{ vars.DEFAULT_CRAFTSMANSHIP_SDG || '15000' }}
           SITE_URL: ${{ vars.SITE_URL || 'https://sudan-gold-exchange.vercel.app' }}
         run: python scripts/gold_sync.py
