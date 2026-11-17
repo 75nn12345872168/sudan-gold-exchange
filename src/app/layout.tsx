@@ -7,8 +7,6 @@ const SITE_TITLE =
 const SITE_DESCRIPTION =
   "منصة أسعار الذهب في السودان لحظة بلحظة: سعر جرام الذهب عيار 24 و22 و21 و18 والجنيه الذهب بالجنيه السوداني وفق سعر الدولار الموازي والرسمي، مع حاسبة الذهب والمصنعية ونصاب الزكاة ورسم بياني لآخر 30 يوماً.";
 
-const googleVerification = process.env.GOOGLE_SITE_VERIFICATION?.trim();
-
 export const metadata: Metadata = {
   metadataBase: new URL(getSiteUrl()),
   title: {
@@ -31,13 +29,9 @@ export const metadata: Metadata = {
   alternates: {
     canonical: "/",
   },
-  ...(googleVerification
-    ? {
-        verification: {
-          google: googleVerification,
-        },
-      }
-    : {}),
+  verification: {
+    google: process.env.GOOGLE_SITE_VERIFICATION || "RulOvlJ1RRQcVh1",
+  },
   openGraph: {
     type: "website",
     locale: "ar_SD",

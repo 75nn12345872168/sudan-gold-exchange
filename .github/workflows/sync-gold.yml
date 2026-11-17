@@ -24,12 +24,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
 
-      - name: Fetch XAU/USD, compute Sudan gold prices, save & broadcast
+      - name: Fetch XAU/USD & parallel USD/SDG, compute Sudan gold prices, save & broadcast
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          USD_SOURCE_URL: ${{ vars.USD_SOURCE_URL || secrets.USD_SOURCE_URL || '' }}
+          USD_MAX_DEVIATION_PCT: ${{ vars.USD_MAX_DEVIATION_PCT || '0.25' }}
           DEFAULT_PARALLEL_USD_SDG: ${{ vars.DEFAULT_PARALLEL_USD_SDG || '2700' }}
           DEFAULT_OFFICIAL_USD_SDG: ${{ vars.DEFAULT_OFFICIAL_USD_SDG || '2020' }}
           DEFAULT_CRAFTSMANSHIP_SDG: ${{ vars.DEFAULT_CRAFTSMANSHIP_SDG || '15000' }}

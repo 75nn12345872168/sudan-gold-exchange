@@ -25,6 +25,7 @@ export function formatGoldBulletinArabic(record: GoldPriceRecord): string {
     `🌍 *الأونصة العالمية:* $${formatUsd(record.ounce_usd)}`,
     `💵 *الدولار الموازي المعتمد:* ${formatSdg(record.parallel_usd_sdg)} ج.س`,
     `🏦 *الدولار الرسمي:* ${formatSdg(record.official_usd_sdg)} ج.س`,
+    `📡 *مصدر التحديث:* \`${record.source}\``,
     "",
     "📊 *أسعار الجرام في السوق السوداني (بالدولار الموازي):*",
     `• *عيار 24:* ${formatSdg(record.karat_24_sdg)} ج.س`,

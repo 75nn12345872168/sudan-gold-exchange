@@ -12,6 +12,18 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+# Support running as `python scripts/gold_sync.py` from repo root or `python gold_sync.py` from scripts/
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from usd_sdg_scraper import (  # noqa: E402
+    MAX_VALID_SDG,
+    MIN_VALID_SDG,
+    ParallelRateResult,
+    fetch_parallel_usd_sdg,
+)
+
 TROY_OUNCE_GRAMS = 31.1035
 NISAB_24K_GRAMS = 85
 DEFAULT_SITE_URL = "https://sudan-gold-exchange.vercel.app"
@@ -131,33 +143,56 @@ def fetch_latest_rates_and_previous(
 
     try:
         fx_resp = requests.get(
-            f"{base_rest}/exchange_rates?select=parallel_usd_sdg,official_usd_sdg,craftsmanship_sdg&order=recorded_at.desc&limit=1",
+            f"{base_rest}/exchange_rates?select=parallel_usd_sdg,official_usd_sdg,craftsmanship_sdg&order=recorded_at.desc&limit=10",
             headers=headers,
             timeout=10,
         )
         if fx_resp.ok and fx_resp.json():
-            row = fx_resp.json()[0]
-            parallel_usd_sdg = float(row.get("parallel_usd_sdg") or default_parallel)
-            official_usd_sdg = float(row.get("official_usd_sdg") or default_official)
-            craftsmanship_sdg = float(row.get("craftsmanship_sdg") or default_craft)
+            rows = fx_resp.json()
+            valid_fx = next(
+                (
+                    r
+                    for r in rows
+                    if MIN_VALID_SDG <= float(r.get("parallel_usd_sdg") or 0) <= MAX_VALID_SDG
+                ),
+                None,
+            )
+            if valid_fx:
+                parallel_usd_sdg = float(valid_fx["parallel_usd_sdg"])
+                official_usd_sdg = float(valid_fx.get("official_usd_sdg") or default_official)
+                craftsmanship_sdg = float(valid_fx.get("craftsmanship_sdg") or default_craft)
+            else:
+                print("[warn] No sane parallel_usd_sdg found in exchange_rates; using default.")
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] Could not read exchange_rates, using defaults: {exc}")
 
     try:
         gold_resp = requests.get(
-            f"{base_rest}/gold_prices?select=karat_24_sdg,parallel_usd_sdg,official_usd_sdg,craftsmanship_sdg&order=recorded_at.desc&limit=1",
+            f"{base_rest}/gold_prices?select=karat_24_sdg,parallel_usd_sdg,official_usd_sdg,craftsmanship_sdg&order=recorded_at.desc&limit=10",
             headers=headers,
             timeout=10,
         )
         if gold_resp.ok and gold_resp.json():
-            row = gold_resp.json()[0]
-            prev_karat_24 = float(row["karat_24_sdg"])
-            if parallel_usd_sdg == default_parallel and row.get("parallel_usd_sdg"):
-                parallel_usd_sdg = float(row["parallel_usd_sdg"])
-            if official_usd_sdg == default_official and row.get("official_usd_sdg"):
-                official_usd_sdg = float(row["official_usd_sdg"])
-            if craftsmanship_sdg == default_craft and row.get("craftsmanship_sdg") is not None:
-                craftsmanship_sdg = float(row["craftsmanship_sdg"])
+            rows = gold_resp.json()
+            valid_gold = next(
+                (
+                    r
+                    for r in rows
+                    if MIN_VALID_SDG <= float(r.get("parallel_usd_sdg") or 0) <= MAX_VALID_SDG
+                ),
+                rows[0],
+            )
+            prev_karat_24 = float(valid_gold["karat_24_sdg"])
+            if (
+                parallel_usd_sdg == default_parallel
+                and valid_gold.get("parallel_usd_sdg")
+                and MIN_VALID_SDG <= float(valid_gold["parallel_usd_sdg"]) <= MAX_VALID_SDG
+            ):
+                parallel_usd_sdg = float(valid_gold["parallel_usd_sdg"])
+            if official_usd_sdg == default_official and valid_gold.get("official_usd_sdg"):
+                official_usd_sdg = float(valid_gold["official_usd_sdg"])
+            if craftsmanship_sdg == default_craft and valid_gold.get("craftsmanship_sdg") is not None:
+                craftsmanship_sdg = float(valid_gold["craftsmanship_sdg"])
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] Could not read previous gold_prices: {exc}")
 
@@ -171,6 +206,7 @@ def calculate_gold_record(
     craftsmanship_sdg: float,
     prev_karat_24: float | None,
     provider: str,
+    fx_result: ParallelRateResult,
 ) -> dict[str, Any]:
     """Compute all gold karats mathematically from XAU/USD and USD/SDG."""
     karat_24 = (ounce_usd / TROY_OUNCE_GRAMS) * parallel_usd_sdg
@@ -195,9 +231,43 @@ def calculate_gold_record(
         "gold_pound_sdg": round(gold_pound, 2),
         "craftsmanship_sdg": round(craftsmanship_sdg, 2),
         "change_pct": change_pct,
-        "source": f"auto_sync:{provider}",
-        "notes": "تحديث آلي مجدول عبر GitHub Actions",
+        "source": f"auto_sync:{provider}|fx:{fx_result.source}",
+        "notes": fx_result.note,
     }
+
+
+def save_exchange_rate_record(
+    supabase_url: str,
+    service_key: str,
+    fx_result: ParallelRateResult,
+    official_usd_sdg: float,
+    craftsmanship_sdg: float,
+    recorded_at: str,
+) -> None:
+    """Persist freshly scraped parallel USD/SDG exchange rate in Supabase."""
+    base_rest = supabase_url.rstrip("/") + "/rest/v1"
+    headers = {
+        **_supabase_headers(service_key),
+        "Prefer": "return=minimal",
+    }
+    payload = {
+        "recorded_at": recorded_at,
+        "parallel_usd_sdg": round(fx_result.rate, 2),
+        "official_usd_sdg": round(official_usd_sdg, 2),
+        "craftsmanship_sdg": round(craftsmanship_sdg, 2),
+        "source": f"auto_scraper:{fx_result.source}",
+        "notes": fx_result.note,
+    }
+    resp = requests.post(
+        f"{base_rest}/exchange_rates",
+        headers=headers,
+        json=payload,
+        timeout=15,
+    )
+    if not resp.ok:
+        print(
+            f"[warn] Could not insert exchange_rates row ({resp.status_code}): {resp.text}"
+        )
 
 
 def save_gold_record(
@@ -225,13 +295,18 @@ def format_sdg(value: float) -> str:
     return f"{round(value):,}"
 
 
-def format_telegram_message(record: dict[str, Any], site_url: str) -> str:
+def format_telegram_message(
+    record: dict[str, Any],
+    site_url: str,
+    fx_result: ParallelRateResult | None = None,
+) -> str:
     """Build formatted Arabic Telegram bulletin."""
     now_sd = datetime.now(KHARTOUM_TZ).strftime("%Y-%m-%d | %I:%M %p")
     change_pct = float(record["change_pct"])
     arrow = "📈" if change_pct > 0 else ("📉" if change_pct < 0 else "➖")
     sign = "+" if change_pct > 0 else ""
     nisab_sdg = float(record["karat_24_sdg"]) * NISAB_24K_GRAMS
+    fx_source_label = fx_result.source if fx_result else str(record.get("source", "auto_sync"))
 
     lines = [
         "🪙 *نشرة أسعار الذهب في السودان — التحديث الدوري*",
@@ -240,6 +315,7 @@ def format_telegram_message(record: dict[str, Any], site_url: str) -> str:
         f"🌍 *الأونصة العالمية:* ${record['ounce_usd']:,.2f}",
         f"💵 *الدولار الموازي المعتمد:* {format_sdg(record['parallel_usd_sdg'])} ج.س",
         f"🏦 *الدولار الرسمي:* {format_sdg(record['official_usd_sdg'])} ج.س",
+        f"📡 *مصدر التحديث:* `{fx_source_label}`",
         "",
         "📊 *أسعار الجرام في السوق السوداني (بالدولار الموازي):*",
         f"• *عيار 24:* {format_sdg(record['karat_24_sdg'])} ج.س",
@@ -266,7 +342,10 @@ def format_telegram_message(record: dict[str, Any], site_url: str) -> str:
     return "\n".join(lines)
 
 
-def send_telegram_bulletin(record: dict[str, Any]) -> None:
+def send_telegram_bulletin(
+    record: dict[str, Any],
+    fx_result: ParallelRateResult | None = None,
+) -> None:
     """Broadcast Arabic bulletin to Telegram channel inside try/except."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     channel_id = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -276,7 +355,7 @@ def send_telegram_bulletin(record: dict[str, Any]) -> None:
         print("[warn] TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID missing; skipping Telegram broadcast.")
         return
 
-    message = format_telegram_message(record, site_url)
+    message = format_telegram_message(record, site_url, fx_result=fx_result)
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
@@ -316,15 +395,22 @@ def main() -> int:
     print(f"[ok] Fetched spot gold XAU/USD = ${ounce_usd:,.2f} via {provider}")
 
     if supabase_url and service_key:
-        parallel_usd, official_usd, craft_sdg, prev_k24 = fetch_latest_rates_and_previous(
+        db_parallel_usd, official_usd, craft_sdg, prev_k24 = fetch_latest_rates_and_previous(
             supabase_url, service_key
         )
     else:
-        parallel_usd = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "2700"))
+        db_parallel_usd = float(os.getenv("DEFAULT_PARALLEL_USD_SDG", "2700"))
         official_usd = float(os.getenv("DEFAULT_OFFICIAL_USD_SDG", "2020"))
         craft_sdg = float(os.getenv("DEFAULT_CRAFTSMANSHIP_SDG", "15000"))
         prev_k24 = None
         print("[warn] Supabase env missing; using default FX rates.")
+
+    fx_result = fetch_parallel_usd_sdg(baseline_rate=db_parallel_usd)
+    parallel_usd = fx_result.rate
+    print(
+        f"[info] Active parallel USD/SDG = {parallel_usd:,.2f} "
+        f"(updated={fx_result.updated}, source={fx_result.source})"
+    )
 
     record = calculate_gold_record(
         ounce_usd=ounce_usd,
@@ -333,6 +419,7 @@ def main() -> int:
         craftsmanship_sdg=craft_sdg,
         prev_karat_24=prev_k24,
         provider=provider,
+        fx_result=fx_result,
     )
 
     print(
@@ -346,7 +433,7 @@ def main() -> int:
 
     if args.dry_run:
         print("[dry-run] Preview Telegram message:\n")
-        print(format_telegram_message(record, DEFAULT_SITE_URL))
+        print(format_telegram_message(record, DEFAULT_SITE_URL, fx_result=fx_result))
         return 0
 
     if not supabase_url or not service_key:
@@ -356,10 +443,20 @@ def main() -> int:
         )
         return 1
 
+    if fx_result.updated:
+        save_exchange_rate_record(
+            supabase_url=supabase_url,
+            service_key=service_key,
+            fx_result=fx_result,
+            official_usd_sdg=official_usd,
+            craftsmanship_sdg=craft_sdg,
+            recorded_at=record["recorded_at"],
+        )
+
     save_gold_record(supabase_url, service_key, record)
     print("[ok] Saved new gold_prices record to Supabase.")
 
-    send_telegram_bulletin(record)
+    send_telegram_bulletin(record, fx_result=fx_result)
     return 0
 
 
