@@ -1,4 +1,4 @@
-"""Fault-tolerant scraper for Sudan parallel market USD/SDG exchange rates."""
+"""Fault-tolerant multi-source scraper and averager for Sudan parallel USD/SDG rates."""
 
 from __future__ import annotations
 
@@ -6,21 +6,27 @@ import html
 import math
 import os
 import re
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from statistics import median
 from typing import Any, Callable
 
 import requests
 
 MIN_VALID_SDG = 500.0
 MAX_VALID_SDG = 50000.0
-DEFAULT_MAX_DEVIATION_RATIO = 0.25  # +/- 25% guardrail against database rate
+DEFAULT_MAX_DEVIATION_RATIO = 0.25  # +/- 25% guardrail against database baseline
+DEFAULT_MAX_ARTICLE_AGE_HOURS = 72
+INTER_SOURCE_SPREAD_RATIO = 0.15  # +/- 15% outlier filter across live sources
 
 SCRAPER_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; SudanGoldExchangeBot/1.0; "
-        "+https://sudan-gold-exchange.vercel.app)"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ar,en;q=0.8",
 }
 
@@ -29,21 +35,31 @@ ARABIC_DIGITS_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "0
 DEFAULT_PUBLIC_SOURCES: list[tuple[str, str]] = [
     (
         "sudanakhbar:wp-json",
-        "https://www.sudanakhbar.com/wp-json/wp/v2/posts?search=%D8%B3%D8%B9%D8%B1+%D8%A7%D9%84%D8%AF%D9%88%D9%84%D8%A7%D8%B1+%D8%A7%D9%84%D8%B3%D9%88%D9%82+%D8%A7%D9%84%D9%85%D9%88%D8%A7%D8%B2%D9%8A&per_page=5",
+        "https://www.sudanakhbar.com/wp-json/wp/v2/posts?per_page=15&_fields=date_gmt,title,content",
     ),
     (
-        "sudanakhbar:dollar-tag",
-        "https://www.sudanakhbar.com/tag/%d8%b3%d8%b9%d8%b1-%d8%a7%d9%84%d8%af%d9%88%d9%84%d8%a7%d8%b1-%d9%81%d9%8a-%d8%a7%d9%84%d8%b3%d9%88%d8%af%d8%a7%d9%86",
+        "dabangasudan:wp-json",
+        "https://www.dabangasudan.org/ar/wp-json/wp/v2/posts?per_page=10&_fields=date_gmt,title,content",
+    ),
+    (
+        "altaghyeer:rss",
+        "https://www.altaghyeer.info/ar/tag/%d8%a3%d8%b3%d8%b9%d8%a7%d8%b1-%d8%a7%d9%84%d8%b9%d9%85%d9%84%d8%a7%d8%AA/feed/",
+    ),
+    (
+        "kushnews:wp-json",
+        "https://kushnews.net/wp-json/wp/v2/posts?per_page=10&_fields=date_gmt,title,content",
     ),
     (
         "alsoug:currency",
         "https://www.alsoug.com/currency",
     ),
-    (
-        "altaghyeer:currencies",
-        "https://www.altaghyeer.info/ar/tag/%d8%a3%d8%b3%d8%b9%d8%a7%d8%b1-%d8%a7%d9%84%d8%b9%d9%85%d9%84%d8%a7%d8%aa/",
-    ),
 ]
+
+
+@dataclass(frozen=True)
+class RateSample:
+    source: str
+    rate: float
 
 
 @dataclass(frozen=True)
@@ -52,6 +68,7 @@ class ParallelRateResult:
     source: str
     updated: bool
     note: str
+    samples: list[RateSample] = field(default_factory=list)
 
 
 def normalize_digits(text: str) -> str:
@@ -84,6 +101,25 @@ def _parse_number(raw: str) -> float | None:
     return None
 
 
+def _is_recent_iso_or_rfc(date_str: str | None, max_age_hours: int) -> bool:
+    """Return True if timestamp is missing or within max_age_hours."""
+    if not date_str:
+        return True
+    dt: datetime | None = None
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(date_str)
+        except Exception:  # noqa: BLE001
+            return True
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    return dt >= cutoff
+
+
 def is_sane_rate(
     candidate: float | None,
     baseline_rate: float | None,
@@ -113,15 +149,92 @@ def is_sane_rate(
     return True, "ok"
 
 
+def _is_non_parallel_article(text: str) -> bool:
+    """Reject bank-only or customs-only articles that do not quote the parallel market."""
+    has_parallel_kw = any(
+        kw in text
+        for kw in ("السوق الموازي", "السوق الموازية", "السوق السوداء", "السوق الأسود", "الموازي")
+    )
+    is_bank_or_customs = any(
+        kw in text
+        for kw in ("من البنوك", "القنوات المصرفية", "لدى البنوك", "الدولار الجمركي")
+    )
+    return is_bank_or_customs and not has_parallel_kw
+
+
+def parse_usd_sdg_from_text(
+    text: str,
+    baseline_rate: float | None = None,
+    max_deviation_ratio: float = DEFAULT_MAX_DEVIATION_RATIO,
+) -> float | None:
+    """Extract parallel USD/SDG rate (averaging buy+sell when both are quoted)."""
+    normalized = normalize_digits(text)
+    if _is_non_parallel_article(normalized):
+        return None
+
+    num_pat = r"((?:\d{1,3}(?:,\d{3})+|\d{3,5})(?:\.\d{1,2})?)"
+
+    # Priority 0: Explicit buy + sell pair near USD (compute midpoint average)
+    pair_patterns = [
+        rf"(?:الدولار(?:\s*الأمريكي|\s*الامريكي)?|USD)[^.\n]{{0,45}}?(?:الشراء|شراء)\s*[:=\-]?\s*{num_pat}[^.\n]{{0,30}}?(?:البيع|بيع)\s*[:=\-]?\s*{num_pat}",
+        rf"(?:متوسط\s*بيع\s*الدولار|بيع\s*الدولار)(?:[^0-9]{{0,35}}?من\s*{num_pat}\s*(?:جنيه(?:اً)?)?\s*إلى\s*|[^0-9]{{0,25}}){num_pat}[^.\n]{{0,90}}?(?:متوسط\s*الشراء|الشراء|شراء)(?:[^0-9]{{0,35}}?من\s*{num_pat}\s*(?:جنيه(?:اً)?)?\s*إلى\s*|[^0-9]{{0,25}}){num_pat}",
+        rf"(?:متوسط\s*شراء\s*الدولار|الشراء|شراء)(?:[^0-9]{{0,35}}?من\s*{num_pat}\s*(?:جنيه(?:اً)?)?\s*إلى\s*|[^0-9]{{0,25}}){num_pat}[^.\n]{{0,90}}?(?:متوسط\s*البيع|البيع|بيع)(?:[^0-9]{{0,35}}?من\s*{num_pat}\s*(?:جنيه(?:اً)?)?\s*إلى\s*|[^0-9]{{0,25}}){num_pat}",
+    ]
+    for idx, pattern in enumerate(pair_patterns):
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            snippet = match.group(0)
+            if "الجمركي" in snippet or "الرسوم الجمركية" in snippet:
+                continue
+            if idx == 0:
+                r1 = _parse_number(match.group(1))
+                r2 = _parse_number(match.group(2))
+            else:
+                # Groups 2 and 4 hold the current/latest price (skipping optional "من X إلى")
+                r1 = _parse_number(match.group(2))
+                r2 = _parse_number(match.group(4))
+            s1, _ = is_sane_rate(r1, baseline_rate, max_deviation_ratio)
+            s2, _ = is_sane_rate(r2, baseline_rate, max_deviation_ratio)
+            if s1 and s2 and r1 is not None and r2 is not None:
+                return round((r1 + r2) / 2.0, 2)
+
+    # Priority 1: Single explicit sell / parallel-market USD phrases (avoid customs dollar)
+    patterns = [
+        rf"(?:بيع\s*(?:الدولار|USD)|الدولار[^.\n]{{0,40}}بيع)(?:[^0-9]{{0,35}}?من\s*\d[\d,.]*\s*(?:جنيه(?:اً)?)?\s*إلى\s*|[^0-9]{{0,25}}){num_pat}",
+        rf"(?:السوق\s*الموازي[ة]?|السوق\s*الأسود|السوق\s*السوداء)[^.\n]{{0,60}}(?:سعر\s*الدولار|الدولار)[^0-9]{{0,35}}{num_pat}",
+        rf"(?:سعر\s*الدولار(?:\s*الأمريكي|\s*الامريكي|\s*الموازي|\s*اليوم)?(?:\s*في\s*السودان)?(?:\s*في\s*السوق\s*الموازي[ة]?)?)[^0-9]{{0,45}}{num_pat}",
+        rf"(?:الدولار\s*(?:الأمريكي|الامريكي|الموازي))[^0-9]{{0,35}}{num_pat}",
+        rf"(?:USD\s*/\s*SDG|USD\s*to\s*SDG|parallel\s*USD)[^0-9]{{0,25}}{num_pat}",
+        rf"{num_pat}\s*(?:جنيه(?:\s*سوداني|اً)?|ج\.س|SDG)[^.\n]{{0,35}}(?:للدولار|الدولار|USD)",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            snippet = match.group(0)
+            if "الجمركي" in snippet or "الرسوم الجمركية" in snippet:
+                continue
+            candidate = _parse_number(match.group(1))
+            sane, _ = is_sane_rate(candidate, baseline_rate, max_deviation_ratio)
+            if sane and candidate is not None:
+                return candidate
+
+    return None
+
+
 def parse_usd_sdg_from_json(
     payload: Any,
     baseline_rate: float | None = None,
     max_deviation_ratio: float = DEFAULT_MAX_DEVIATION_RATIO,
+    max_age_hours: int = DEFAULT_MAX_ARTICLE_AGE_HOURS,
 ) -> float | None:
-    """Extract USD/SDG parallel rate from common JSON or WordPress REST API payloads."""
+    """Extract USD/SDG parallel rate from JSON API or recent WordPress REST posts."""
     if isinstance(payload, dict):
-        # WordPress post object: prioritize parallel-market sentences inside rendered content
         if "content" in payload and isinstance(payload["content"], dict):
+            post_date = payload.get("date_gmt") or payload.get("date")
+            if not _is_recent_iso_or_rfc(
+                str(post_date) if post_date else None, max_age_hours
+            ):
+                return None
+
             title_raw = (
                 payload.get("title", {}).get("rendered", "")
                 if isinstance(payload.get("title"), dict)
@@ -129,11 +242,11 @@ def parse_usd_sdg_from_json(
             )
             content_raw = payload["content"].get("rendered", "")
             combined = strip_html(f"{title_raw}. {content_raw}")
-            extracted = parse_usd_sdg_from_text(
-                combined, baseline_rate=baseline_rate, max_deviation_ratio=max_deviation_ratio
+            return parse_usd_sdg_from_text(
+                combined,
+                baseline_rate=baseline_rate,
+                max_deviation_ratio=max_deviation_ratio,
             )
-            if extracted is not None:
-                return extracted
 
         for key in (
             "parallel_usd_sdg",
@@ -164,50 +277,51 @@ def parse_usd_sdg_from_json(
                     payload[nested_key],
                     baseline_rate=baseline_rate,
                     max_deviation_ratio=max_deviation_ratio,
+                    max_age_hours=max_age_hours,
                 )
                 if nested is not None:
                     return nested
     elif isinstance(payload, list):
+        # Average across multiple valid recent WordPress posts if present
+        post_rates: list[float] = []
         for item in payload:
             nested = parse_usd_sdg_from_json(
                 item,
                 baseline_rate=baseline_rate,
                 max_deviation_ratio=max_deviation_ratio,
+                max_age_hours=max_age_hours,
             )
             if nested is not None:
-                return nested
+                if isinstance(item, dict) and "content" in item:
+                    post_rates.append(nested)
+                else:
+                    return nested
+        if post_rates:
+            return round(sum(post_rates) / len(post_rates), 2)
     return None
 
 
-def parse_usd_sdg_from_text(
-    text: str,
+def parse_rss_feed(
+    raw_xml: str,
     baseline_rate: float | None = None,
     max_deviation_ratio: float = DEFAULT_MAX_DEVIATION_RATIO,
+    max_age_hours: int = DEFAULT_MAX_ARTICLE_AGE_HOURS,
 ) -> float | None:
-    """Extract a sane USD/SDG parallel rate from Arabic or English market text."""
-    normalized = normalize_digits(text)
-    num_pat = r"((?:\d{1,3}(?:,\d{3})+|\d{3,5})(?:\.\d{1,2})?)"
-
-    # Priority 1: Explicit sell / parallel-market USD phrases (avoid customs dollar)
-    patterns = [
-        rf"(?:بيع\s*(?:الدولار|USD)|الدولار[^.\n]{{0,40}}بيع)[^0-9]{{0,25}}{num_pat}",
-        rf"(?:السوق\s*الموازي[ة]?|السوق\s*الأسود|السوق\s*السوداء)[^.\n]{{0,60}}(?:سعر\s*الدولار|الدولار)[^0-9]{{0,35}}{num_pat}",
-        rf"(?:سعر\s*الدولار(?:\s*الأمريكي|\s*الامريكي|\s*الموازي|\s*اليوم)?(?:\s*في\s*السودان)?(?:\s*في\s*السوق\s*الموازي[ة]?)?)[^0-9]{{0,45}}{num_pat}",
-        rf"(?:الدولار\s*(?:الأمريكي|الامريكي|الموازي))[^0-9]{{0,35}}{num_pat}",
-        rf"(?:USD\s*/\s*SDG|USD\s*to\s*SDG|parallel\s*USD)[^0-9]{{0,25}}{num_pat}",
-        rf"{num_pat}\s*(?:جنيه(?:\s*سوداني|اً)?|ج\.س|SDG)[^.\n]{{0,35}}(?:للدولار|الدولار|USD)",
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
-            snippet = match.group(0)
-            if "الجمركي" in snippet or "الرسوم الجمركية" in snippet:
-                continue
-            candidate = _parse_number(match.group(1))
-            sane, _ = is_sane_rate(candidate, baseline_rate, max_deviation_ratio)
-            if sane and candidate is not None:
-                return candidate
-
+    """Extract average USD/SDG rate from recent RSS <item> entries."""
+    items = re.findall(r"<item>(.*?)</item>", raw_xml, flags=re.IGNORECASE | re.DOTALL)
+    rates: list[float] = []
+    for item in items[:6]:
+        pub_match = re.search(
+            r"<pubDate>(.*?)</pubDate>", item, flags=re.IGNORECASE | re.DOTALL
+        )
+        if pub_match and not _is_recent_iso_or_rfc(pub_match.group(1).strip(), max_age_hours):
+            continue
+        text = strip_html(item)
+        rate = parse_usd_sdg_from_text(text, baseline_rate, max_deviation_ratio)
+        if rate is not None:
+            rates.append(rate)
+    if rates:
+        return round(sum(rates) / len(rates), 2)
     return None
 
 
@@ -216,7 +330,7 @@ def parse_telegram_web_preview(
     baseline_rate: float | None = None,
     max_deviation_ratio: float = DEFAULT_MAX_DEVIATION_RATIO,
 ) -> float | None:
-    """Parse latest posts from a public Telegram t.me/s/<channel> page."""
+    """Parse latest post from a public Telegram t.me/s/<channel> page."""
     messages = re.findall(
         r'<div[^>]*class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
         raw_html,
@@ -237,11 +351,13 @@ def _scrape_url(
     max_deviation_ratio: float,
     session_get: Callable[..., requests.Response],
 ) -> tuple[float | None, str]:
-    resp = session_get(url, headers=SCRAPER_HEADERS, timeout=10)
+    resp = session_get(url, headers=SCRAPER_HEADERS, timeout=12)
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "").lower()
-    if "application/json" in content_type or resp.text.lstrip().startswith(("{", "[")):
+    body = resp.text
+
+    if "application/json" in content_type or body.lstrip().startswith(("{", "[")):
         try:
             candidate = parse_usd_sdg_from_json(
                 resp.json(),
@@ -255,7 +371,12 @@ def _scrape_url(
         except ValueError:
             pass
 
-    body = resp.text
+    if "xml" in content_type or "<rss" in body[:400].lower():
+        candidate = parse_rss_feed(body, baseline_rate, max_deviation_ratio)
+        if candidate is not None:
+            return candidate, "ok"
+        return None, "no recent USD/SDG item in RSS feed"
+
     if "t.me/s/" in url:
         candidate = parse_telegram_web_preview(body, baseline_rate, max_deviation_ratio)
         if candidate is not None:
@@ -266,7 +387,38 @@ def _scrape_url(
     if candidate is not None:
         return candidate, "ok"
 
-    return None, "no valid USD/SDG rate matched or failed +/-25% sanity bounds"
+    return None, "no recent valid USD/SDG rate matched or failed +/-25% sanity bounds"
+
+
+def aggregate_rate_samples(samples: list[RateSample]) -> list[RateSample]:
+    """Filter inter-source outliers beyond +/-15% from median when >= 3 samples exist."""
+    if len(samples) < 3:
+        return samples
+    med = median(s.rate for s in samples)
+    filtered = [
+        s
+        for s in samples
+        if med > 0 and abs(s.rate - med) / med <= INTER_SOURCE_SPREAD_RATIO
+    ]
+    return filtered or samples
+
+
+def _build_source_list(source_url: str | None) -> list[tuple[str, str]]:
+    sources: list[tuple[str, str]] = []
+
+    raw_urls = os.getenv("USD_SOURCE_URLS", "").strip()
+    if raw_urls:
+        for idx, item in enumerate(raw_urls.split(","), start=1):
+            cleaned = item.strip()
+            if cleaned:
+                sources.append((f"env:USD_SOURCE_{idx}", cleaned))
+
+    single_url = (source_url or os.getenv("USD_SOURCE_URL", "")).strip()
+    if single_url and all(existing != single_url for _, existing in sources):
+        sources.append(("env:USD_SOURCE_URL", single_url))
+
+    sources.extend(DEFAULT_PUBLIC_SOURCES)
+    return sources
 
 
 def fetch_parallel_usd_sdg(
@@ -275,21 +427,19 @@ def fetch_parallel_usd_sdg(
     max_deviation_ratio: float | None = None,
     session_get: Callable[..., requests.Response] = requests.get,
 ) -> ParallelRateResult:
-    """Fetch Sudan parallel market USD/SDG rate with +/-25% sanity guardrails and fallback."""
+    """Query ALL specialized Sudan FX sources, filter outliers, and return their average."""
     deviation_limit = (
         max_deviation_ratio
         if max_deviation_ratio is not None
         else float(os.getenv("USD_MAX_DEVIATION_PCT", str(DEFAULT_MAX_DEVIATION_RATIO)))
     )
 
-    configured_url = (source_url or os.getenv("USD_SOURCE_URL", "")).strip()
-    sources: list[tuple[str, str]] = []
-    if configured_url:
-        sources.append(("env:USD_SOURCE_URL", configured_url))
-    sources.extend(DEFAULT_PUBLIC_SOURCES)
-
+    sources = _build_source_list(source_url)
+    samples: list[RateSample] = []
     failures: list[str] = []
-    for name, url in sources:
+
+    def _run_one(item: tuple[str, str]) -> tuple[str, float | None, str]:
+        name, url = item
         try:
             rate, reason = _scrape_url(
                 name=name,
@@ -298,19 +448,36 @@ def fetch_parallel_usd_sdg(
                 max_deviation_ratio=deviation_limit,
                 session_get=session_get,
             )
-            if rate is not None:
-                return ParallelRateResult(
-                    rate=rate,
-                    source=name,
-                    updated=True,
-                    note=f"تم تحديث سعر الدولار الموازي آلياً من {name}",
-                )
-            failures.append(f"{name}: {reason}")
+            return name, rate, reason
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"{name}: {exc}")
+            return name, None, str(exc)
+
+    with ThreadPoolExecutor(max_workers=min(len(sources), 6)) as pool:
+        for name, rate, reason in pool.map(_run_one, sources):
+            if rate is not None:
+                samples.append(RateSample(source=name, rate=rate))
+            else:
+                failures.append(f"{name}: {reason}")
+
+    if samples:
+        clean_samples = aggregate_rate_samples(samples)
+        avg_rate = round(sum(s.rate for s in clean_samples) / len(clean_samples), 2)
+        summary = ", ".join(f"{s.source}={s.rate:,.0f}" for s in clean_samples)
+        source_tag = (
+            clean_samples[0].source
+            if len(clean_samples) == 1
+            else f"avg({len(clean_samples)}):{'+'.join(s.source.split(':')[0] for s in clean_samples)}"
+        )
+        return ParallelRateResult(
+            rate=avg_rate,
+            source=source_tag,
+            updated=True,
+            note=f"متوسط تلقائي من {len(clean_samples)} مصدر ({summary})",
+            samples=clean_samples,
+        )
 
     print(
-        "[warn] Parallel USD/SDG scraping failed or rejected as outlier; "
+        "[warn] Parallel USD/SDG scraping failed or rejected as outlier across all sources; "
         f"retaining last valid Supabase rate {baseline_rate}. Details: "
         + " | ".join(failures)
     )
@@ -319,4 +486,5 @@ def fetch_parallel_usd_sdg(
         source="supabase:retained_last_valid",
         updated=False,
         note="الاحتفاظ بآخر سعر دولار موازي مسجل في قاعدة البيانات بعد تعذر المصادر الخارجية",
+        samples=[],
     )

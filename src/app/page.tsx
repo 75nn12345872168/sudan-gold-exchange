@@ -89,6 +89,11 @@ export default async function HomePage() {
                 والجنيه الذهب، محسوب آلياً وفق حركة الأونصة العالمية وسعر الصرف
                 الموازي والرسمي.
               </p>
+              {latest.notes && (
+                <p className="text-xs text-amber-200/80">
+                  مصدر تسعير الموازي: {latest.notes}
+                </p>
+              )}
 
               <div className="flex flex-wrap items-center gap-3 pt-2">
                 <a

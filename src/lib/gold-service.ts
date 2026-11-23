@@ -1,3 +1,4 @@
+import { getOrRefreshCachedLiveSync } from "./auto-sync";
 import {
   buildFallbackExchangeRate,
   buildFallbackGoldHistory,
@@ -8,6 +9,8 @@ import type {
   ExchangeRateRecord,
   GoldPriceRecord,
 } from "./types";
+
+const STALE_THRESHOLD_MS = 60 * 60 * 1000; // Refresh automatically if DB reading is >= 60m old
 
 function toNum(value: unknown, fallback = 0): number {
   const n = Number(value);
@@ -45,6 +48,20 @@ function normalizeExchangeRow(row: Record<string, unknown>): ExchangeRateRecord 
   };
 }
 
+function mergeChartHistory(
+  baseHistory: GoldPriceRecord[],
+  liveLatest: GoldPriceRecord
+): GoldPriceRecord[] {
+  const last = baseHistory[baseHistory.length - 1];
+  if (!last) return [liveLatest];
+  const lastTs = new Date(last.recorded_at).getTime();
+  const liveTs = new Date(liveLatest.recorded_at).getTime();
+  if (Math.abs(liveTs - lastTs) < 5 * 60 * 1000) {
+    return [...baseHistory.slice(0, -1), liveLatest];
+  }
+  return [...baseHistory, liveLatest];
+}
+
 export async function getDashboardData(): Promise<DashboardData> {
   const fallbackHistory = buildFallbackGoldHistory();
   const fallbackLatest = fallbackHistory[fallbackHistory.length - 1];
@@ -52,12 +69,33 @@ export async function getDashboardData(): Promise<DashboardData> {
 
   const supabase = createPublicSupabaseClient();
   if (!supabase) {
+    const live = await getOrRefreshCachedLiveSync({
+      baselineParallel: fallbackLatest.parallel_usd_sdg,
+      baselineOfficial: fallbackLatest.official_usd_sdg,
+      baselineCraftsmanship: fallbackLatest.craftsmanship_sdg,
+      previousKarat24:
+        fallbackHistory.length >= 2
+          ? fallbackHistory[fallbackHistory.length - 2].karat_24_sdg
+          : null,
+      persistToSupabase: false,
+    });
+
+    if (live) {
+      return {
+        latest: live.gold,
+        history: mergeChartHistory(fallbackHistory, live.gold),
+        latestExchangeRate: live.exchangeRate,
+        isFallback: false,
+        dataSourceLabel: "تحديث تلقائي حي • متوسط السوق الموازي والأونصة",
+      };
+    }
+
     return {
       latest: fallbackLatest,
       history: fallbackHistory,
       latestExchangeRate: fallbackFx,
       isFallback: true,
-      dataSourceLabel: "بيانات مرجعية أولية (بانتظار ربط Supabase)",
+      dataSourceLabel: "بيانات مرجعية أولية",
     };
   }
 
@@ -78,29 +116,61 @@ export async function getDashboardData(): Promise<DashboardData> {
           .from("exchange_rates")
           .select("*")
           .order("recorded_at", { ascending: false })
-          .limit(1),
+          .limit(10),
       ]);
 
+    const validFxRow = (fxRows ?? []).find((row) => {
+      const rate = toNum((row as Record<string, unknown>).parallel_usd_sdg);
+      return rate >= 500 && rate <= 50000;
+    }) as Record<string, unknown> | undefined;
+
+    const latestDbFx = validFxRow
+      ? normalizeExchangeRow(validFxRow)
+      : fallbackFx;
+
     if (goldError || !goldRows || goldRows.length === 0) {
+      const live = await getOrRefreshCachedLiveSync({
+        baselineParallel: latestDbFx.parallel_usd_sdg,
+        baselineOfficial: latestDbFx.official_usd_sdg,
+        baselineCraftsmanship: latestDbFx.craftsmanship_sdg,
+        previousKarat24: null,
+        persistToSupabase: true,
+      });
+
+      if (live) {
+        return {
+          latest: live.gold,
+          history: mergeChartHistory(fallbackHistory, live.gold),
+          latestExchangeRate: live.exchangeRate,
+          isFallback: false,
+          dataSourceLabel: "تحديث تلقائي حي • متوسط السوق الموازي والأونصة",
+        };
+      }
+
       return {
         latest: fallbackLatest,
         history: fallbackHistory,
-        latestExchangeRate:
-          fxRows && fxRows.length > 0
-            ? normalizeExchangeRow(fxRows[0] as Record<string, unknown>)
-            : fallbackFx,
+        latestExchangeRate: latestDbFx,
         isFallback: true,
         dataSourceLabel: "بيانات مرجعية لآخر 30 يوماً (بانتظار أول مزامنة)",
       };
     }
 
-    const normalizedHistory = goldRows.map((row) =>
-      normalizeGoldRow(row as Record<string, unknown>)
-    );
-    const latest = normalizedHistory[normalizedHistory.length - 1];
+    const normalizedHistory = goldRows
+      .map((row) => normalizeGoldRow(row as Record<string, unknown>))
+      .filter((row) => row.parallel_usd_sdg >= 500 && row.parallel_usd_sdg <= 50000);
 
-    // If Supabase only has 1-2 records so far, prepend older fallback points
-    // before the earliest live record so the 7/30-day chart never looks empty.
+    if (normalizedHistory.length === 0) {
+      return {
+        latest: fallbackLatest,
+        history: fallbackHistory,
+        latestExchangeRate: latestDbFx,
+        isFallback: true,
+        dataSourceLabel: "بيانات مرجعية أولية",
+      };
+    }
+
+    let latest = normalizedHistory[normalizedHistory.length - 1];
     let chartHistory = normalizedHistory;
     if (normalizedHistory.length < 7) {
       const earliestLiveTs = new Date(normalizedHistory[0].recorded_at).getTime();
@@ -110,27 +180,61 @@ export async function getDashboardData(): Promise<DashboardData> {
       chartHistory = [...olderSeed, ...normalizedHistory];
     }
 
-    const latestExchangeRate =
-      fxRows && fxRows.length > 0
-        ? normalizeExchangeRow(fxRows[0] as Record<string, unknown>)
-        : {
-            id: "derived-from-gold",
-            recorded_at: latest.recorded_at,
-            parallel_usd_sdg: latest.parallel_usd_sdg,
-            official_usd_sdg: latest.official_usd_sdg,
-            craftsmanship_sdg: latest.craftsmanship_sdg,
-            source: latest.source,
-            notes: latest.notes,
-          };
+    let latestExchangeRate: ExchangeRateRecord = validFxRow
+      ? latestDbFx
+      : {
+          id: "derived-from-gold",
+          recorded_at: latest.recorded_at,
+          parallel_usd_sdg: latest.parallel_usd_sdg,
+          official_usd_sdg: latest.official_usd_sdg,
+          craftsmanship_sdg: latest.craftsmanship_sdg,
+          source: latest.source,
+          notes: latest.notes,
+        };
+
+    // Auto-refresh automatically if latest Supabase record is >= 60 minutes old
+    const ageMs = Date.now() - new Date(latest.recorded_at).getTime();
+    if (Number.isNaN(ageMs) || ageMs >= STALE_THRESHOLD_MS) {
+      const live = await getOrRefreshCachedLiveSync({
+        baselineParallel: latestExchangeRate.parallel_usd_sdg,
+        baselineOfficial: latestExchangeRate.official_usd_sdg,
+        baselineCraftsmanship: latestExchangeRate.craftsmanship_sdg,
+        previousKarat24: latest.karat_24_sdg,
+        persistToSupabase: true,
+      });
+
+      if (live) {
+        latest = live.gold;
+        latestExchangeRate = live.exchangeRate;
+        chartHistory = mergeChartHistory(chartHistory, live.gold);
+      }
+    }
 
     return {
       latest,
       history: chartHistory,
       latestExchangeRate,
       isFallback: false,
-      dataSourceLabel: "بيانات حية متصلة بقاعدة البيانات",
+      dataSourceLabel: "بيانات حية متصلة ومحدّثة تلقائياً",
     };
   } catch {
+    const live = await getOrRefreshCachedLiveSync({
+      baselineParallel: fallbackLatest.parallel_usd_sdg,
+      baselineOfficial: fallbackLatest.official_usd_sdg,
+      baselineCraftsmanship: fallbackLatest.craftsmanship_sdg,
+      persistToSupabase: false,
+    });
+
+    if (live) {
+      return {
+        latest: live.gold,
+        history: mergeChartHistory(fallbackHistory, live.gold),
+        latestExchangeRate: live.exchangeRate,
+        isFallback: false,
+        dataSourceLabel: "تحديث تلقائي حي • متوسط السوق الموازي والأونصة",
+      };
+    }
+
     return {
       latest: fallbackLatest,
       history: fallbackHistory,
