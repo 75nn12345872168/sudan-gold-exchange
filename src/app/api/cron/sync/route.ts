@@ -58,6 +58,7 @@ export async function GET(request: NextRequest) {
   }
 
   const notify = request.nextUrl.searchParams.get("notify") === "1";
+  const debug = request.nextUrl.searchParams.get("debug") === "1";
   const result = await runAutoMarketSync({
     baselineParallel,
     baselineOfficial,
@@ -81,5 +82,6 @@ export async function GET(request: NextRequest) {
     persisted: result.persisted,
     record: result.gold,
     telegram: result.telegram,
+    ...(debug ? { fxDiagnostics: result.fxDiagnostics } : {}),
   });
 }

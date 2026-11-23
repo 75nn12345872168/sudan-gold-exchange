@@ -31,6 +31,10 @@ const DEFAULT_PUBLIC_SOURCES: Array<{ name: string; url: string }> = [
     url: "https://kushnews.net/wp-json/wp/v2/posts?per_page=10&_fields=date_gmt,title,content",
   },
   {
+    name: "gnews:rss",
+    url: "https://news.google.com/rss/search?q=%D8%B3%D8%B9%D8%B1+%D8%A7%D9%84%D8%AF%D9%88%D9%84%D8%A7%D8%B1+%D9%81%D9%8A+%D8%A7%D9%84%D8%B3%D9%88%D8%AF%D8%A7%D9%86+%D8%A7%D9%84%D9%85%D9%88%D8%A7%D8%B2%D9%8A+when:3d&hl=ar&gl=SD&ceid=SD:ar",
+  },
+  {
     name: "alsoug:currency",
     url: "https://www.alsoug.com/currency",
   },
@@ -41,12 +45,20 @@ export interface RateSample {
   rate: number;
 }
 
+export interface SourceDiagnostic {
+  source: string;
+  ok: boolean;
+  rate?: number;
+  detail: string;
+}
+
 export interface ParallelFxResult {
   rate: number;
   source: string;
   updated: boolean;
   note: string;
   samples: RateSample[];
+  diagnostics: SourceDiagnostic[];
 }
 
 const ARABIC_INDIC = "٠١٢٣٤٥٦٧٨٩";
@@ -389,50 +401,118 @@ async function scrapeSource(
   source: { name: string; url: string },
   baselineRate: number | null,
   maxDeviationRatio: number
-): Promise<RateSample | null> {
-  const res = await fetch(source.url, {
-    headers: SCRAPER_HEADERS,
-    cache: "no-store",
-    signal: AbortSignal.timeout(9000),
-  });
-  if (!res.ok) return null;
-
-  const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-  const body = await res.text();
-  const trimmed = body.trimStart();
-
-  if (
-    contentType.includes("application/json") ||
-    trimmed.startsWith("{") ||
-    trimmed.startsWith("[")
-  ) {
-    try {
-      const json = JSON.parse(body) as unknown;
-      const rate = parseFromJson(json, baselineRate, maxDeviationRatio);
-      if (isSaneParallelRate(rate, baselineRate, maxDeviationRatio) && rate !== null) {
-        return { source: source.name, rate };
-      }
-    } catch {
-      // Fall through to text parsing
+): Promise<{ sample: RateSample | null; diagnostic: SourceDiagnostic }> {
+  try {
+    const res = await fetch(source.url, {
+      headers: SCRAPER_HEADERS,
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      return {
+        sample: null,
+        diagnostic: {
+          source: source.name,
+          ok: false,
+          detail: `HTTP ${res.status}`,
+        },
+      };
     }
-  }
 
-  if (contentType.includes("xml") || body.slice(0, 400).toLowerCase().includes("<rss")) {
-    const rate = parseRssFeed(body, baselineRate, maxDeviationRatio);
-    return rate !== null ? { source: source.name, rate } : null;
-  }
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const body = await res.text();
+    const trimmed = body.trimStart();
 
-  if (source.url.includes("t.me/s/")) {
-    const rate = parseTelegramWebPreview(body, baselineRate, maxDeviationRatio);
-    if (rate !== null) return { source: source.name, rate };
-  }
+    if (
+      contentType.includes("application/json") ||
+      trimmed.startsWith("{") ||
+      trimmed.startsWith("[")
+    ) {
+      try {
+        const json = JSON.parse(body) as unknown;
+        const rate = parseFromJson(json, baselineRate, maxDeviationRatio);
+        if (
+          isSaneParallelRate(rate, baselineRate, maxDeviationRatio) &&
+          rate !== null
+        ) {
+          return {
+            sample: { source: source.name, rate },
+            diagnostic: { source: source.name, ok: true, rate, detail: "json" },
+          };
+        }
+        return {
+          sample: null,
+          diagnostic: {
+            source: source.name,
+            ok: false,
+            detail: "json: no recent valid rate",
+          },
+        };
+      } catch {
+        // Fall through to text parsing
+      }
+    }
 
-  const rate = parseUsdSdgFromText(
-    stripHtml(body),
-    baselineRate,
-    maxDeviationRatio
-  );
-  return rate !== null ? { source: source.name, rate } : null;
+    if (
+      contentType.includes("xml") ||
+      body.slice(0, 400).toLowerCase().includes("<rss")
+    ) {
+      const rate = parseRssFeed(body, baselineRate, maxDeviationRatio);
+      if (rate !== null) {
+        return {
+          sample: { source: source.name, rate },
+          diagnostic: { source: source.name, ok: true, rate, detail: "rss" },
+        };
+      }
+      return {
+        sample: null,
+        diagnostic: {
+          source: source.name,
+          ok: false,
+          detail: "rss: no recent valid item",
+        },
+      };
+    }
+
+    if (source.url.includes("t.me/s/")) {
+      const rate = parseTelegramWebPreview(body, baselineRate, maxDeviationRatio);
+      if (rate !== null) {
+        return {
+          sample: { source: source.name, rate },
+          diagnostic: { source: source.name, ok: true, rate, detail: "telegram" },
+        };
+      }
+    }
+
+    const rate = parseUsdSdgFromText(
+      stripHtml(body),
+      baselineRate,
+      maxDeviationRatio
+    );
+    if (rate !== null) {
+      return {
+        sample: { source: source.name, rate },
+        diagnostic: { source: source.name, ok: true, rate, detail: "html" },
+      };
+    }
+    return {
+      sample: null,
+      diagnostic: {
+        source: source.name,
+        ok: false,
+        detail: "html: no valid rate matched",
+      },
+    };
+  } catch (err) {
+    return {
+      sample: null,
+      diagnostic: {
+        source: source.name,
+        ok: false,
+        detail: err instanceof Error ? err.message : "fetch error",
+      },
+    };
+  }
 }
 
 function buildSourceList(): Array<{ name: string; url: string }> {
@@ -475,14 +555,16 @@ export async function fetchAverageParallelUsdSdg(
   const maxDeviationRatio = Number(process.env.USD_MAX_DEVIATION_PCT ?? "0.25") || DEFAULT_MAX_DEVIATION_RATIO;
   const sources = buildSourceList();
 
-  const settled = await Promise.allSettled(
+  const settled = await Promise.all(
     sources.map((src) => scrapeSource(src, baselineRate, maxDeviationRatio))
   );
 
   const samples: RateSample[] = [];
+  const diagnostics: SourceDiagnostic[] = [];
   for (const outcome of settled) {
-    if (outcome.status === "fulfilled" && outcome.value !== null) {
-      samples.push(outcome.value);
+    diagnostics.push(outcome.diagnostic);
+    if (outcome.sample !== null) {
+      samples.push(outcome.sample);
     }
   }
 
@@ -507,6 +589,7 @@ export async function fetchAverageParallelUsdSdg(
       updated: true,
       note: `متوسط تلقائي من ${cleanSamples.length} مصدر (${summary})`,
       samples: cleanSamples,
+      diagnostics,
     };
   }
 
@@ -516,6 +599,7 @@ export async function fetchAverageParallelUsdSdg(
     updated: false,
     note: "الاحتفاظ بآخر سعر موازي معتمد لحين توفر قراءة جديدة من المصادر",
     samples: [],
+    diagnostics,
   };
 }
 

@@ -36,6 +36,7 @@ export interface AutoSyncResult {
   gold: GoldPriceRecord;
   exchangeRate: ExchangeRateRecord;
   persisted: boolean;
+  fxDiagnostics?: unknown;
   telegram?: { sent: boolean; reason?: string };
 }
 
@@ -173,6 +174,7 @@ export async function runAutoMarketSync(
     gold,
     exchangeRate,
     persisted,
+    fxDiagnostics: snapshot.fx.diagnostics,
     telegram,
   };
 }

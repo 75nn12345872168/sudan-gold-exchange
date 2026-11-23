@@ -4,7 +4,11 @@ export function createPublicSupabaseClient(): SupabaseClient | null {
   const url =
     process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() ||
     process.env.SUPABASE_URL?.trim();
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  const anonKey =
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() ||
+    (typeof window === "undefined"
+      ? process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
+      : undefined);
 
   if (!url || !anonKey) {
     return null;
